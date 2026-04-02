@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: 2022-2024 Espressif Systems (Shanghai) CO LTD
+ * SPDX-FileCopyrightText: 2026 Sempre IoT (São Paulo)  LTD
  * SPDX-License-Identifier: Apache-2.0
  *
  * Fire Alarm — single file with retry + tree topology log.
@@ -43,14 +43,16 @@
 #define PFX_ACK "A:"
 #define ALARM_PAYLOAD "ALARM:HIGH"
 #define DATA_FMT "D:ALARM:%s:seq=%" PRIu32 ":mac=%02x:%02x:%02x:%02x:%02x:%02x"
-#define ACK_FMT "A:seq=%" PRIu32 ":mac=%02x:%02x:%02x:%02x:%02x:%02x"
+#define ACK_FMT                                                                \
+  "A:seq=%" PRIu32 ":mac=%02x:%02x:%02x:%02x:%02x:%02x:rssi=%d:par=%02x:%02x:" \
+  "%02x:%02x:%02x:%02x"
 
 /* ─── Tuning ──────────────────────────────────────────────────────── */
 #define MSG_MAX_LEN 128
 #define RX_QUEUE_DEPTH 32
 #define TX_QUEUE_DEPTH 8
 #define ACK_QUEUE_DEPTH 64
-#define LED_GPIO 2
+#define LED_GPIO 13
 
 /* Retry config */
 #define ACK_WINDOW_MS 1500    /* wait this long before checking ACKs  */
@@ -61,6 +63,18 @@
 #define MAX_TRACKED_NODES 32
 
 #define BUTTON_GPIO GPIO_NUM_0
+
+/* ─── Upstream alarm (NODE → ROOT) ───────────────────────────────── */
+#define NODE_ALARM_PORT 3335
+#define NODE_ACK_PORT 3336
+#define UA_FMT                                                                 \
+  "UA:ALARM:seq=%" PRIu32 ":mac=%02x:%02x:%02x:%02x:%02x:%02x:rssi=%d"
+#define UAK_FMT "UAK:seq=%" PRIu32 ":mac=%02x:%02x:%02x:%02x:%02x:%02x"
+#define PFX_UA "UA:"
+#define PFX_UAK "UAK:"
+#define NODE_ALARM_RETRIES 20
+#define NODE_ALARM_RETRY_DELAY_MS 800
+#define NODE_ALARM_ACK_WINDOW_MS 1200
 
 static const char *TAG = "fire_alarm";
 
@@ -83,6 +97,9 @@ static QueueHandle_t s_ack_queue = NULL;
 #if !CONFIG_MESH_ROOT
 static QueueHandle_t s_rx_queue = NULL;
 static QueueHandle_t s_fwd_ack_queue = NULL;
+static QueueHandle_t s_node_alarm_trigger_queue = NULL;
+static QueueHandle_t s_fwd_alarm_queue =
+    NULL; /* child UA: msgs → relay upstream */
 #endif
 
 /* ─── Stats ───────────────────────────────────────────────────────── */
@@ -95,6 +112,11 @@ static uint32_t s_rx_overflow = 0;
 static uint32_t s_fwd_ok = 0;
 static uint32_t s_fwd_fail = 0;
 static uint32_t s_ack_sent = 0;
+static uint32_t s_upstream_alarm_sent = 0;
+static uint32_t s_upstream_alarm_acked_cnt = 0;
+/* volatile: written by uak_rx task, read by alarm send task */
+static volatile uint32_t s_node_alarm_seq = 0;
+static volatile bool s_node_alarm_acked = false;
 #endif
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -104,8 +126,10 @@ static uint32_t s_ack_sent = 0;
 
 typedef struct {
   uint8_t mac[6];
-  int level; /* populated from mesh node list if available */
+  uint8_t parent_mac[6]; /* STA MAC of direct parent (bssid - 1 on ESP32) */
+  int level;
   bool valid;
+  int8_t rssi; /* RSSI to direct parent, from last ACK */
 } tracked_node_t;
 
 typedef struct {
@@ -120,28 +144,42 @@ static pending_t s_pending = {0};
 
 static SemaphoreHandle_t s_nodes_mutex = NULL;
 
-static int track_node_locked(const uint8_t mac[6], int level) {
+static const uint8_t s_zero_mac[6] = {0};
+
+static int track_node_locked(const uint8_t mac[6], int level, int8_t rssi,
+                             const uint8_t parent_mac[6]) {
   for (int i = 0; i < s_node_count; i++)
     if (memcmp(s_nodes[i].mac, mac, 6) == 0) {
       if (level > 0)
         s_nodes[i].level = level;
+      if (rssi != 0)
+        s_nodes[i].rssi = rssi;
+      if (parent_mac && memcmp(parent_mac, s_zero_mac, 6) != 0)
+        memcpy(s_nodes[i].parent_mac, parent_mac, 6);
       return i;
     }
   if (s_node_count >= MAX_TRACKED_NODES)
     return -1;
   memcpy(s_nodes[s_node_count].mac, mac, 6);
+  memcpy(s_nodes[s_node_count].parent_mac, parent_mac ? parent_mac : s_zero_mac,
+         6);
   s_nodes[s_node_count].level = level;
   s_nodes[s_node_count].valid = true;
-  ESP_LOGI(TAG, "[ROOT] new node [%d] level=%d mac:" MACSTR, s_node_count,
-           level, MAC2STR(mac));
+  s_nodes[s_node_count].rssi = rssi;
+  ESP_LOGI(TAG,
+           "[ROOT] new node [%d] mac:" MACSTR "  parent:" MACSTR
+           "  rssi=%ddBm  level=%d",
+           s_node_count, MAC2STR(mac),
+           MAC2STR(s_nodes[s_node_count].parent_mac), rssi, level);
   return s_node_count++;
 }
 
-static void record_ack(uint32_t seq, const uint8_t mac[6]) {
+static void record_ack(uint32_t seq, const uint8_t mac[6], int8_t rssi,
+                       const uint8_t parent_mac[6]) {
   if (!s_pending.active || s_pending.seq != seq)
     return;
   xSemaphoreTake(s_nodes_mutex, portMAX_DELAY);
-  int idx = track_node_locked(mac, 0);
+  int idx = track_node_locked(mac, 0, rssi, parent_mac);
   if (idx >= 0)
     s_pending.acked[idx] = true;
   xSemaphoreGive(s_nodes_mutex);
@@ -168,159 +206,60 @@ static int count_acked(void) {
   return c;
 }
 
-/* ── ASCII tree topology print ──────────────────────────────────────
- * Groups nodes by level and prints as:
- *
- *  MESH TOPOLOGY (4 nodes)
- *  └── [ROOT] d4:e9:f4:bc:a2:c8  (level 1)
- *      ├── [L2] 40:22:d8:7b:84:80  ✓ acked
- *      ├── [L2] 00:4b:12:2d:f7:8c  ✓ acked
- *      │   ├── [L3] e0:5a:1b:50:22:68  ✗ MISSING
- *      │   └── [L3] 38:18:2b:8c:13:d0  ✗ MISSING
- */
-// static void print_tree(uint32_t seq) {
-//   /* Gather levels — use mesh node list to enrich level info */
-//   uint32_t mesh_size = 0;
-//   const node_info_list_t *node = esp_mesh_lite_get_nodes_list(&mesh_size);
-//   xSemaphoreTake(s_nodes_mutex, portMAX_DELAY);
-//   for (uint32_t i = 0; i < mesh_size && node; i++) {
-//     // track_node_locked(node->node->mac_addr, node->node->level);
-//     if (memcmp(node->node->mac_addr, root_mac, 6) != 0) {
-//       track_node_locked(node->node->mac_addr, node->node->level);
-//     }
-//     node = node->next;
-//   }
+/* Recursive depth-first tree printer. Called with mutex already held. */
+static void print_children_locked(const uint8_t parent_mac[6], int depth,
+                                  uint32_t seq) {
+  /* count direct children of parent_mac */
+  int child_cnt = 0;
+  for (int i = 0; i < s_node_count; i++)
+    if (memcmp(s_nodes[i].parent_mac, parent_mac, 6) == 0)
+      child_cnt++;
+  if (child_cnt == 0)
+    return;
 
-//   uint8_t root_mac[6];
-//   esp_wifi_get_mac(WIFI_IF_STA, root_mac);
+  int drawn = 0;
+  for (int i = 0; i < s_node_count; i++) {
+    if (memcmp(s_nodes[i].parent_mac, parent_mac, 6) != 0)
+      continue;
+    drawn++;
+    const char *branch = (drawn < child_cnt) ? "├──" : "└──";
 
-//   ESP_LOGI(TAG, "");
-//   ESP_LOGI(TAG, "  MESH TOPOLOGY  seq=%" PRIu32 "  (%d tracked nodes)", seq,
-//            s_node_count);
-//   ESP_LOGI(TAG, "  └── [ROOT] " MACSTR, MAC2STR(root_mac));
+    /* indent: 4 spaces per depth level */
+    char indent[64] = "";
+    for (int d = 0; d < depth; d++)
+      strncat(indent, "    ", sizeof(indent) - strlen(indent) - 1);
 
-//   /* Print each level from 2 upward */
-//   int max_level = 2;
-//   for (int i = 0; i < s_node_count; i++)
-//     if (s_nodes[i].level > max_level)
-//       max_level = s_nodes[i].level;
+    int lvl = s_nodes[i].level ? s_nodes[i].level : depth + 2;
 
-//   for (int lvl = 2; lvl <= max_level; lvl++) {
-//     /* count nodes at this level for tree branch drawing */
-//     int cnt = 0;
-//     for (int i = 0; i < s_node_count; i++)
-//       if (s_nodes[i].level == lvl)
-//         cnt++;
-//     int drawn = 0;
-//     for (int i = 0; i < s_node_count; i++) {
-//       if (s_nodes[i].level != lvl)
-//         continue;
-//       drawn++;
-//       const char *branch = (drawn < cnt) ? "├──" : "└──";
-//       /* build indent based on level */
-//       char indent[64] = "  ";
-//       for (int d = 2; d < lvl; d++)
-//         strncat(indent, "│   ", sizeof(indent) - strlen(indent) - 1);
+    if (s_pending.active && s_pending.seq == seq) {
+      bool acked = s_pending.acked[i];
+      if (acked)
+        ESP_LOGI(TAG,
+                 "  %s%s [L%d] " MACSTR "  rssi=%ddBm  via=" MACSTR "  \u2713",
+                 indent, branch, lvl, MAC2STR(s_nodes[i].mac),
+                 (int)s_nodes[i].rssi, MAC2STR(parent_mac));
+      else
+        ESP_LOGW(TAG,
+                 "  %s%s [L%d] " MACSTR "  rssi=%ddBm  via=" MACSTR
+                 "  \u2717 MISSING",
+                 indent, branch, lvl, MAC2STR(s_nodes[i].mac),
+                 (int)s_nodes[i].rssi, MAC2STR(parent_mac));
+    } else {
+      ESP_LOGI(TAG, "  %s%s [L%d] " MACSTR "  rssi=%ddBm  via=" MACSTR, indent,
+               branch, lvl, MAC2STR(s_nodes[i].mac), (int)s_nodes[i].rssi,
+               MAC2STR(parent_mac));
+    }
 
-//       if (s_pending.active && s_pending.seq == seq) {
-//         bool acked = s_pending.acked[i];
-//         if (acked) {
-//           ESP_LOGI(TAG, "  %s%s [L%d] " MACSTR "  \u2713 acked", indent,
-//           branch,
-//                    lvl, MAC2STR(s_nodes[i].mac));
-//         } else {
-//           ESP_LOGW(TAG, "  %s%s [L%d] " MACSTR "  \u2717 MISSING", indent,
-//                    branch, lvl, MAC2STR(s_nodes[i].mac));
-//         }
-//       } else {
-//         ESP_LOGI(TAG, "  %s%s [L%d] " MACSTR, indent, branch, lvl,
-//                  MAC2STR(s_nodes[i].mac));
-//       }
-//     }
-//   }
-//   ESP_LOGI(TAG, "");
-//   xSemaphoreGive(s_nodes_mutex);
-// }
+    /* recurse into this node's children */
+    print_children_locked(s_nodes[i].mac, depth + 1, seq);
+  }
+}
 
-// static void print_tree(uint32_t seq) {
-//   uint8_t root_mac[6];
-//   esp_wifi_get_mac(WIFI_IF_STA, root_mac);
-
-//   /* OPTIONAL: try to enrich levels, but DO NOT override tracked nodes */
-//   uint32_t mesh_size = 0;
-//   const node_info_list_t *node = esp_mesh_lite_get_nodes_list(&mesh_size);
-
-//   xSemaphoreTake(s_nodes_mutex, portMAX_DELAY);
-
-//   while (node) {
-//     for (int i = 0; i < s_node_count; i++) {
-//       if (memcmp(s_nodes[i].mac, node->node->mac_addr, 6) == 0) {
-//         // update level only if found
-//         s_nodes[i].level = node->node->level;
-//         break;
-//       }
-//     }
-//     node = node->next;
-//   }
-
-//   ESP_LOGI(TAG, "");
-//   ESP_LOGI(TAG, "  MESH TOPOLOGY  seq=%" PRIu32 "  (%d tracked nodes)", seq,
-//            s_node_count);
-//   ESP_LOGI(TAG, "  └── [ROOT] " MACSTR, MAC2STR(root_mac));
-
-//   /* ensure ALL nodes appear (even without level) */
-//   int max_level = 2;
-//   for (int i = 0; i < s_node_count; i++) {
-//     if (s_nodes[i].level == 0) {
-//       s_nodes[i].level = 2; // fallback
-//     }
-//     if (s_nodes[i].level > max_level)
-//       max_level = s_nodes[i].level;
-//   }
-
-//   for (int lvl = 2; lvl <= max_level; lvl++) {
-//     int cnt = 0;
-//     for (int i = 0; i < s_node_count; i++)
-//       if (s_nodes[i].level == lvl)
-//         cnt++;
-
-//     int drawn = 0;
-//     for (int i = 0; i < s_node_count; i++) {
-//       if (s_nodes[i].level != lvl)
-//         continue;
-
-//       drawn++;
-//       const char *branch = (drawn < cnt) ? "├──" : "└──";
-
-//       char indent[64] = "  ";
-//       for (int d = 2; d < lvl; d++)
-//         strncat(indent, "│   ", sizeof(indent) - strlen(indent) - 1);
-
-//       if (s_pending.active && s_pending.seq == seq) {
-//         bool acked = s_pending.acked[i];
-//         if (acked) {
-//           ESP_LOGI(TAG, "  %s%s [L%d] " MACSTR "  \u2713 acked", indent,
-//           branch,
-//                    lvl, MAC2STR(s_nodes[i].mac));
-//         } else {
-//           ESP_LOGW(TAG, "  %s%s [L%d] " MACSTR "  \u2717 MISSING", indent,
-//                    branch, lvl, MAC2STR(s_nodes[i].mac));
-//         }
-//       } else {
-//         ESP_LOGI(TAG, "  %s%s [L%d] " MACSTR, indent, branch, lvl,
-//                  MAC2STR(s_nodes[i].mac));
-//       }
-//     }
-//   }
-
-//   ESP_LOGI(TAG, "");
-//   xSemaphoreGive(s_nodes_mutex);
-// }
 static void print_tree(uint32_t seq) {
-  uint8_t root_mac[6];
-  esp_wifi_get_mac(WIFI_IF_STA, root_mac);
+  uint8_t my_root_mac[6];
+  esp_wifi_get_mac(WIFI_IF_STA, my_root_mac);
 
-  /* OPTIONAL: enrich levels WITHOUT overriding */
+  /* Enrich levels from mesh node list (best-effort, no override) */
   uint32_t mesh_size = 0;
   const node_info_list_t *node = esp_mesh_lite_get_nodes_list(&mesh_size);
 
@@ -329,10 +268,8 @@ static void print_tree(uint32_t seq) {
   while (node) {
     for (int i = 0; i < s_node_count; i++) {
       if (memcmp(s_nodes[i].mac, node->node->mac_addr, 6) == 0) {
-        // ONLY update if mesh gives a valid level (>0)
-        if (node->node->level > 0) {
+        if (node->node->level > 0)
           s_nodes[i].level = node->node->level;
-        }
         break;
       }
     }
@@ -341,87 +278,35 @@ static void print_tree(uint32_t seq) {
 
   ESP_LOGI(TAG, "");
   ESP_LOGI(TAG, "Internet : %s", s_wifi_connected ? "connected" : "offline");
-  ESP_LOGI(TAG, "  MESH TOPOLOGY  seq=%" PRIu32 "  (%d tracked nodes)", seq,
+  ESP_LOGI(TAG, "  MESH TOPOLOGY  seq=%" PRIu32 "  (%d nodes)", seq,
            s_node_count);
-  ESP_LOGI(TAG, "  └── [ROOT] " MACSTR, MAC2STR(root_mac));
+  ESP_LOGI(TAG, "  [L1] " MACSTR "  <ROOT>", MAC2STR(my_root_mac));
 
-  /* find max level WITHOUT modifying data */
-  int max_level = 1;
+  /* Main tree: depth-first walk from root */
+  print_children_locked(my_root_mac, 0, seq);
+
+  /* Orphan nodes: parent unknown (all-zero parent_mac).
+   * These are nodes that only sent old-format ACKs without :par= */
+  bool any_orphan = false;
   for (int i = 0; i < s_node_count; i++) {
-    if (s_nodes[i].level > max_level)
-      max_level = s_nodes[i].level;
-  }
-
-  /* print ALL nodes — even if level is unknown (0) */
-  for (int lvl = 1; lvl <= max_level; lvl++) {
-    int cnt = 0;
-
-    for (int i = 0; i < s_node_count; i++) {
-      if (s_nodes[i].level == lvl)
-        cnt++;
+    if (memcmp(s_nodes[i].parent_mac, s_zero_mac, 6) != 0)
+      continue;
+    if (!any_orphan) {
+      ESP_LOGW(TAG, "  [parent unknown — old firmware or first seen]");
+      any_orphan = true;
     }
-
-    int drawn = 0;
-
-    for (int i = 0; i < s_node_count; i++) {
-      if (s_nodes[i].level != lvl)
-        continue;
-
-      drawn++;
-      const char *branch = (drawn < cnt) ? "├──" : "└──";
-
-      char indent[64] = "  ";
-      for (int d = 1; d < lvl; d++) {
-        strncat(indent, "│   ", sizeof(indent) - strlen(indent) - 1);
-      }
-
-      if (s_pending.active && s_pending.seq == seq) {
-        bool acked = s_pending.acked[i];
-
-        if (acked) {
-          ESP_LOGI(TAG, "  %s%s [L%d] " MACSTR "  \u2713 acked", indent, branch,
-                   lvl, MAC2STR(s_nodes[i].mac));
-        } else {
-          ESP_LOGW(TAG, "  %s%s [L%d] " MACSTR "  \u2717 MISSING", indent,
-                   branch, lvl, MAC2STR(s_nodes[i].mac));
-        }
-      } else {
-        ESP_LOGI(TAG, "  %s%s [L%d] " MACSTR, indent, branch, lvl,
-                 MAC2STR(s_nodes[i].mac));
-      }
-    }
-  }
-
-  /* 🔥 EXTRA: print nodes with unknown level (level == 0) */
-  int unknown_cnt = 0;
-  for (int i = 0; i < s_node_count; i++) {
-    if (s_nodes[i].level == 0)
-      unknown_cnt++;
-  }
-
-  if (unknown_cnt > 0) {
-    int drawn = 0;
-    for (int i = 0; i < s_node_count; i++) {
-      if (s_nodes[i].level != 0)
-        continue;
-
-      drawn++;
-      const char *branch = (drawn < unknown_cnt) ? "├──" : "└──";
-
-      if (s_pending.active && s_pending.seq == seq) {
-        bool acked = s_pending.acked[i];
-
-        if (acked) {
-          ESP_LOGI(TAG, "    %s [L?] " MACSTR "  %s", branch,
-                   MAC2STR(s_nodes[i].mac), "✓ acked");
-        } else {
-          ESP_LOGW(TAG, "    %s [L?] " MACSTR "  %s", branch,
-                   MAC2STR(s_nodes[i].mac), "✗ MISSING");
-        }
-
-      } else {
-        ESP_LOGI(TAG, "    %s [L?] " MACSTR, branch, MAC2STR(s_nodes[i].mac));
-      }
+    int lvl = s_nodes[i].level ? s_nodes[i].level : 0;
+    if (s_pending.active && s_pending.seq == seq) {
+      bool acked = s_pending.acked[i];
+      if (acked)
+        ESP_LOGI(TAG, "  └── [L%d?] " MACSTR "  rssi=%ddBm  \u2713", lvl,
+                 MAC2STR(s_nodes[i].mac), (int)s_nodes[i].rssi);
+      else
+        ESP_LOGW(TAG, "  └── [L%d?] " MACSTR "  rssi=%ddBm  \u2717 MISSING",
+                 lvl, MAC2STR(s_nodes[i].mac), (int)s_nodes[i].rssi);
+    } else {
+      ESP_LOGI(TAG, "  └── [L%d?] " MACSTR "  rssi=%ddBm", lvl,
+               MAC2STR(s_nodes[i].mac), (int)s_nodes[i].rssi);
     }
   }
 
@@ -512,6 +397,24 @@ static esp_err_t udp_unicast_parent(const char *msg, uint16_t len,
   return (r > 0) ? ESP_OK : ESP_FAIL;
 }
 
+/* Broadcast on a specific port (used for UAK downstream) */
+static esp_err_t udp_broadcast_port(const char *msg, uint16_t len,
+                                    uint16_t port) {
+  int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (sock < 0)
+    return ESP_FAIL;
+  int yes = 1;
+  setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &yes, sizeof(yes));
+  struct sockaddr_in dest = {
+      .sin_family = AF_INET,
+      .sin_port = htons(port),
+      .sin_addr.s_addr = get_ap_broadcast(),
+  };
+  int r = sendto(sock, msg, len, 0, (struct sockaddr *)&dest, sizeof(dest));
+  close(sock);
+  return (r > 0) ? ESP_OK : ESP_FAIL;
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * ROOT — produce + retry loop
  *
@@ -590,20 +493,130 @@ static void root_ack_process_task(void *arg) {
       continue;
 
     uint32_t seq = 0;
+    unsigned int m[6] = {0}, p[6] = {0};
+    int rssi_val = 0;
+
+    /* Try full format (14 fields: seq+mac+rssi+par).
+     * Fall back to rssi-only (8) or legacy no-rssi (7). */
+    int fields = sscanf(msg.data,
+                        "A:seq=%" PRIu32 ":mac=%x:%x:%x:%x:%x:%x:rssi=%d"
+                        ":par=%x:%x:%x:%x:%x:%x",
+                        &seq, &m[0], &m[1], &m[2], &m[3], &m[4], &m[5],
+                        &rssi_val, &p[0], &p[1], &p[2], &p[3], &p[4], &p[5]);
+    if (fields < 7) {
+      ESP_LOGE(TAG, "Error, the data is malformed");
+      continue; /* malformed */
+    }
+
+    uint8_t mac[6], par[6];
+    for (int i = 0; i < 6; i++) {
+      mac[i] = (uint8_t)m[i];
+      par[i] = (fields >= 14) ? (uint8_t)p[i] : 0;
+    }
+    if (fields < 8)
+      rssi_val = 0; /* old firmware, no RSSI */
+
+    record_ack(seq, mac, (int8_t)rssi_val, par);
+
+    int acked = count_acked();
+    int missing = s_node_count - acked;
+    ESP_LOGI(TAG,
+             "[ROOT-ACK] seq=%" PRIu32 "  from " MACSTR
+             "  rssi=%ddBm  par=" MACSTR "  acked=%d/%d  missing=%d",
+             seq, MAC2STR(mac), rssi_val, MAC2STR(par), acked, s_node_count,
+             missing);
+  }
+}
+
+/* ROOT — upstream alarm receiver: listens for UA: messages from nodes */
+static void root_upstream_rx_task(void *arg) {
+  int sock = -1;
+  while (sock < 0) {
+    sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+  }
+  int yes = 1;
+  setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+  struct sockaddr_in bind_addr = {
+      .sin_family = AF_INET,
+      .sin_port = htons(NODE_ALARM_PORT),
+      .sin_addr.s_addr = htonl(INADDR_ANY),
+  };
+  while (bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+    ESP_LOGW(TAG, "[ROOT-UP] bind() retry...");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+  ESP_LOGI(TAG, "[ROOT-UP] upstream alarm listener on port %d",
+           NODE_ALARM_PORT);
+
+  char buf[MSG_MAX_LEN];
+  struct sockaddr_in src;
+  socklen_t src_len = sizeof(src);
+
+  while (1) {
+    int len = recvfrom(sock, buf, MSG_MAX_LEN - 1, 0, (struct sockaddr *)&src,
+                       &src_len);
+    if (len <= 0)
+      continue;
+    buf[len] = '\0';
+
+    char src_ip[16];
+    inet_ntop(AF_INET, &src.sin_addr, src_ip, sizeof(src_ip));
+    ESP_LOGW(TAG, "[ROOT-UP] raw RX from=%s  '%s'", src_ip, buf);
+
+    if (strncmp(buf, PFX_UA, strlen(PFX_UA)) != 0) {
+      ESP_LOGW(TAG, "[ROOT-UP] unknown prefix, ignored");
+      continue;
+    }
+
+    uint32_t seq = 0;
     unsigned int m[6] = {0};
-    if (sscanf(msg.data, "A:seq=%" PRIu32 ":mac=%x:%x:%x:%x:%x:%x", &seq, &m[0],
-               &m[1], &m[2], &m[3], &m[4], &m[5]) == 7) {
+    int rssi_val = 0;
+    int parsed =
+        sscanf(buf, "UA:ALARM:seq=%" PRIu32 ":mac=%x:%x:%x:%x:%x:%x:rssi=%d",
+               &seq, &m[0], &m[1], &m[2], &m[3], &m[4], &m[5], &rssi_val);
+    if (parsed != 8) {
+      ESP_LOGE(TAG, "[ROOT-UP] sscanf failed (got %d/8 fields)", parsed);
+      continue;
+    }
+    {
       uint8_t mac[6];
       for (int i = 0; i < 6; i++)
         mac[i] = (uint8_t)m[i];
-      record_ack(seq, mac);
 
-      int acked = count_acked();
-      int missing = s_node_count - acked;
-      ESP_LOGI(TAG,
-               "[ROOT-ACK] seq=%" PRIu32 "  from " MACSTR
-               "  acked=%d/%d  missing=%d",
-               seq, MAC2STR(mac), acked, s_node_count, missing);
+      /* ── Special ROOT log ── */
+      ESP_LOGE(TAG, "");
+      ESP_LOGE(TAG, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+      ESP_LOGE(TAG, "!!  [ROOT] NODE ALARM RECEIVED                  !!");
+      ESP_LOGE(TAG, "!!  Sender MAC : " MACSTR, MAC2STR(mac));
+      ESP_LOGE(TAG, "!!  RSSI       : %ddBm (to parent)", rssi_val);
+      ESP_LOGE(TAG, "!!  seq        : %" PRIu32, seq);
+      ESP_LOGE(TAG, "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!");
+      ESP_LOGE(TAG, "");
+
+      /* Register node with RSSI so topology shows it */
+      xSemaphoreTake(s_nodes_mutex, portMAX_DELAY);
+      track_node_locked(mac, 0, (int8_t)rssi_val, NULL);
+      xSemaphoreGive(s_nodes_mutex);
+
+      /* Send UAK back downstream (broadcast on AP) */
+      char ack[MSG_MAX_LEN];
+      uint16_t ack_len =
+          (uint16_t)snprintf(ack, sizeof(ack), UAK_FMT, seq, mac[0], mac[1],
+                             mac[2], mac[3], mac[4], mac[5]);
+
+      for (int t = 0; t < 3; t++) {
+        if (udp_broadcast_port(ack, ack_len, NODE_ACK_PORT) == ESP_OK) {
+          ESP_LOGI(TAG, "[ROOT-UP] UAK sent  '%s'", ack);
+          break;
+        }
+        ESP_LOGW(TAG, "[ROOT-UP] UAK send retry %d/3", t + 1);
+        vTaskDelay(pdMS_TO_TICKS(100));
+      }
     }
   }
 }
@@ -770,10 +783,21 @@ static void node_forward_task(void *arg) {
     if (parsed) {
       uint8_t my_mac[6];
       esp_wifi_get_mac(WIFI_IF_STA, my_mac);
+
+      wifi_ap_record_t ap_info = {0};
+      esp_wifi_sta_get_ap_info(&ap_info); /* RSSI + parent BSSID */
+
+      /* On ESP32, AP_MAC = STA_MAC + 1 (last byte).
+       * Derive parent STA MAC from the BSSID we connected to. */
+      uint8_t par_sta[6];
+      memcpy(par_sta, ap_info.bssid, 6);
+      par_sta[5] = (par_sta[5] > 0) ? par_sta[5] - 1 : 0xFF;
+
       char ack[MSG_MAX_LEN];
-      uint16_t ack_len = (uint16_t)snprintf(ack, sizeof(ack), ACK_FMT, seq,
-                                            my_mac[0], my_mac[1], my_mac[2],
-                                            my_mac[3], my_mac[4], my_mac[5]);
+      uint16_t ack_len = (uint16_t)snprintf(
+          ack, sizeof(ack), ACK_FMT, seq, my_mac[0], my_mac[1], my_mac[2],
+          my_mac[3], my_mac[4], my_mac[5], (int)ap_info.rssi, par_sta[0],
+          par_sta[1], par_sta[2], par_sta[3], par_sta[4], par_sta[5]);
 
       /* Retry ACK send up to 3 times to handle transient failures */
       for (int t = 0; t < 3; t++) {
@@ -806,6 +830,255 @@ static void node_ack_fwd_task(void *arg) {
     }
   }
 }
+
+/* ═══════════════════════════════════════════════════════════════════
+ * NODE — GPIO0 button → trigger upstream alarm
+ * ═══════════════════════════════════════════════════════════════════ */
+static void node_button_task(void *arg) {
+  gpio_config_t btn_cfg = {
+      .pin_bit_mask = 1ULL << BUTTON_GPIO,
+      .mode = GPIO_MODE_INPUT,
+      .pull_up_en = GPIO_PULLUP_ENABLE,
+  };
+  gpio_config(&btn_cfg);
+
+  int last = 1;
+  while (1) {
+    int cur = gpio_get_level(BUTTON_GPIO);
+    if (last == 1 && cur == 0) { /* falling edge = press */
+      uint8_t trig = 1;
+      xQueueSend(s_node_alarm_trigger_queue, &trig, 0);
+      ESP_LOGI(TAG, "[NODE-BTN] GPIO0 pressed → upstream alarm triggered");
+    }
+    last = cur;
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * NODE — upstream alarm sender with 20 retries + ACK wait
+ * ═══════════════════════════════════════════════════════════════════ */
+static void node_upstream_alarm_task(void *arg) {
+  uint8_t trig;
+  uint32_t seq = 0;
+  uint8_t my_mac[6];
+  esp_wifi_get_mac(WIFI_IF_STA, my_mac);
+
+  while (1) {
+    if (xQueueReceive(s_node_alarm_trigger_queue, &trig, portMAX_DELAY) !=
+        pdTRUE)
+      continue;
+
+    seq++;
+    s_node_alarm_seq = seq;
+    s_node_alarm_acked = false;
+    s_upstream_alarm_sent++;
+
+    wifi_ap_record_t ap_info = {0};
+    esp_wifi_sta_get_ap_info(&ap_info); /* RSSI to our parent */
+
+    char msg[MSG_MAX_LEN];
+    uint16_t msg_len = (uint16_t)snprintf(
+        msg, sizeof(msg), UA_FMT, seq, my_mac[0], my_mac[1], my_mac[2],
+        my_mac[3], my_mac[4], my_mac[5], (int)ap_info.rssi);
+
+    ESP_LOGW(TAG,
+             "[NODE-ALARM] *** Button pressed! Sending upstream alarm"
+             "  seq=%" PRIu32 "  mac=" MACSTR "  rssi=%ddBm ***",
+             seq, MAC2STR(my_mac), (int)ap_info.rssi);
+
+    bool acked = false;
+    for (int attempt = 1; attempt <= NODE_ALARM_RETRIES; attempt++) {
+      esp_err_t err = udp_unicast_parent(msg, msg_len, NODE_ALARM_PORT);
+      if (err == ESP_OK) {
+        ESP_LOGI(TAG, "[NODE-ALARM] sent  attempt=%d/%d  seq=%" PRIu32, attempt,
+                 NODE_ALARM_RETRIES, seq);
+      } else {
+        ESP_LOGW(TAG, "[NODE-ALARM] send FAIL  attempt=%d/%d  seq=%" PRIu32,
+                 attempt, NODE_ALARM_RETRIES, seq);
+      }
+
+      /* Wait for ACK */
+      vTaskDelay(pdMS_TO_TICKS(NODE_ALARM_ACK_WINDOW_MS));
+
+      if (s_node_alarm_acked && s_node_alarm_seq == seq) {
+        acked = true;
+        s_upstream_alarm_acked_cnt++;
+        ESP_LOGI(TAG,
+                 "[NODE-ALARM] *** ACK RECEIVED  seq=%" PRIu32
+                 "  after %d attempt(s) ***",
+                 seq, attempt);
+        break;
+      }
+
+      if (attempt < NODE_ALARM_RETRIES) {
+        ESP_LOGW(TAG, "[NODE-ALARM] no ACK yet, retry %d/%d  seq=%" PRIu32,
+                 attempt + 1, NODE_ALARM_RETRIES, seq);
+        vTaskDelay(pdMS_TO_TICKS(NODE_ALARM_RETRY_DELAY_MS));
+      }
+    }
+
+    if (!acked) {
+      ESP_LOGE(TAG,
+               "[NODE-ALARM] DELIVERY FAILED  seq=%" PRIu32
+               "  after %d retries  (sent=%" PRIu32 "  acked=%" PRIu32 ")",
+               seq, NODE_ALARM_RETRIES, s_upstream_alarm_sent,
+               s_upstream_alarm_acked_cnt);
+    }
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * NODE — upstream alarm RX: pure blocking recvfrom (no SO_RCVTIMEO),
+ *        mirrors node_ack_rx_task pattern which is proven to work for L3.
+ *        Receives UA: from children, enqueues to s_fwd_alarm_queue.
+ * ═══════════════════════════════════════════════════════════════════ */
+static void node_alarm_rx_task(void *arg) {
+  int sock = -1;
+  while (sock < 0) {
+    sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+  }
+  int yes = 1;
+  setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+  /* NO SO_RCVTIMEO — pure blocking, same as node_ack_rx_task */
+
+  struct sockaddr_in bind_addr = {
+      .sin_family = AF_INET,
+      .sin_port = htons(NODE_ALARM_PORT),
+      .sin_addr.s_addr = htonl(INADDR_ANY),
+  };
+  while (bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+    ESP_LOGW(TAG, "[NODE-ALARM-RX] bind() retry...");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+  ESP_LOGI(TAG, "[NODE-ALARM-RX] ready on port %d", NODE_ALARM_PORT);
+
+  mesh_msg_t msg;
+  struct sockaddr_in src;
+  socklen_t src_len = sizeof(src);
+
+  while (1) {
+    int len = recvfrom(sock, msg.data, MSG_MAX_LEN - 1, 0,
+                       (struct sockaddr *)&src, &src_len);
+    if (len <= 0)
+      continue;
+    msg.data[len] = '\0';
+    msg.len = (uint16_t)len;
+
+    if (strncmp(msg.data, PFX_UA, strlen(PFX_UA)) != 0)
+      continue;
+
+    char src_ip[16];
+    inet_ntop(AF_INET, &src.sin_addr, src_ip, sizeof(src_ip));
+    ESP_LOGI(TAG, "[NODE-ALARM-RX] got UA from child %s  '%s'", src_ip,
+             msg.data);
+
+    if (xQueueSend(s_fwd_alarm_queue, &msg, 0) != pdTRUE)
+      ESP_LOGW(TAG, "[NODE-ALARM-RX] queue full, dropped '%s'", msg.data);
+  }
+}
+
+/* NODE — upstream alarm relay: takes from queue, forwards upstream.
+ * Mirrors node_ack_fwd_task — the proven forwarding pattern. */
+static void node_alarm_fwd_task(void *arg) {
+  mesh_msg_t msg;
+  while (1) {
+    if (xQueueReceive(s_fwd_alarm_queue, &msg, portMAX_DELAY) != pdTRUE)
+      continue;
+    for (int t = 0; t < 5; t++) {
+      if (udp_unicast_parent(msg.data, msg.len, NODE_ALARM_PORT) == ESP_OK) {
+        ESP_LOGI(TAG, "[NODE-ALARM-FWD] relayed upstream  '%s'", msg.data);
+        break;
+      }
+      ESP_LOGW(TAG, "[NODE-ALARM-FWD] relay retry %d/5", t + 1);
+      vTaskDelay(pdMS_TO_TICKS(200));
+    }
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+ * NODE — UAK downstream receiver: receives root ACK (UAK:),
+ *        signals own alarm task if MAC matches,
+ *        forwards downstream so deeper nodes get their ACK too.
+ * ═══════════════════════════════════════════════════════════════════ */
+static void node_uak_rx_task(void *arg) {
+  int sock = -1;
+  while (sock < 0) {
+    sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      continue;
+    }
+  }
+  int yes = 1;
+  setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+
+  struct sockaddr_in bind_addr = {
+      .sin_family = AF_INET,
+      .sin_port = htons(NODE_ACK_PORT),
+      .sin_addr.s_addr = htonl(INADDR_ANY),
+  };
+  while (bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+    ESP_LOGW(TAG, "[NODE-UAK-RX] bind() retry...");
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+  ESP_LOGI(TAG, "[NODE-UAK-RX] ready on port %d", NODE_ACK_PORT);
+
+  uint8_t my_mac[6];
+  esp_wifi_get_mac(WIFI_IF_STA, my_mac);
+
+  char buf[MSG_MAX_LEN];
+  struct sockaddr_in src;
+  socklen_t src_len = sizeof(src);
+
+  while (1) {
+    int len = recvfrom(sock, buf, MSG_MAX_LEN - 1, 0, (struct sockaddr *)&src,
+                       &src_len);
+    if (len <= 0)
+      continue;
+    buf[len] = '\0';
+
+    if (strncmp(buf, PFX_UAK, strlen(PFX_UAK)) != 0)
+      continue;
+
+    uint32_t seq = 0;
+    unsigned int m[6] = {0};
+    if (sscanf(buf, "UAK:seq=%" PRIu32 ":mac=%x:%x:%x:%x:%x:%x", &seq, &m[0],
+               &m[1], &m[2], &m[3], &m[4], &m[5]) == 7) {
+      uint8_t ack_mac[6];
+      for (int i = 0; i < 6; i++)
+        ack_mac[i] = (uint8_t)m[i];
+
+      /* Is this ACK for us? */
+      if (memcmp(ack_mac, my_mac, 6) == 0) {
+        ESP_LOGI(TAG, "[NODE-UAK-RX] *** ROOT ACK for US  seq=%" PRIu32 " ***",
+                 seq);
+        if (s_node_alarm_seq == seq)
+          s_node_alarm_acked = true;
+      } else {
+        ESP_LOGI(TAG, "[NODE-UAK-RX] UAK for " MACSTR "  seq=%" PRIu32,
+                 MAC2STR(ack_mac), seq);
+      }
+
+      /* Forward downstream so level-3+ nodes can receive their ACK */
+      wifi_sta_list_t sl = {0};
+      esp_wifi_ap_get_sta_list(&sl);
+      if (sl.num > 0) {
+        if (udp_broadcast_port(buf, (uint16_t)len, NODE_ACK_PORT) == ESP_OK) {
+          ESP_LOGI(TAG, "[NODE-UAK-RX] UAK forwarded downstream  children=%d",
+                   sl.num);
+        } else {
+          ESP_LOGW(TAG, "[NODE-UAK-RX] UAK fwd downstream FAIL");
+        }
+      }
+    }
+  }
+}
+
 #endif /* !CONFIG_MESH_ROOT */
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -1143,7 +1416,10 @@ void app_main(void) {
 #if !CONFIG_MESH_ROOT
   s_rx_queue = xQueueCreate(RX_QUEUE_DEPTH, sizeof(mesh_msg_t));
   s_fwd_ack_queue = xQueueCreate(ACK_QUEUE_DEPTH, sizeof(mesh_msg_t));
-  configASSERT(s_rx_queue && s_fwd_ack_queue);
+  s_node_alarm_trigger_queue = xQueueCreate(4, sizeof(uint8_t));
+  s_fwd_alarm_queue = xQueueCreate(ACK_QUEUE_DEPTH, sizeof(mesh_msg_t));
+  configASSERT(s_rx_queue && s_fwd_ack_queue && s_node_alarm_trigger_queue &&
+               s_fwd_alarm_queue);
 #endif
 
   /* ── Tasks ── */
@@ -1156,11 +1432,17 @@ void app_main(void) {
   xTaskCreate(button_pressed, "button_pressed", 4096, NULL, 5, NULL);
   xTaskCreate(root_ack_rx_task, "root_ack_rx", 4096, NULL, 7, NULL);
   xTaskCreate(root_ack_process_task, "root_ack_proc", 4096, NULL, 6, NULL);
+  xTaskCreate(root_upstream_rx_task, "root_up_rx", 4096, NULL, 7, NULL);
 #else
   xTaskCreate(node_rx_task, "node_rx", 4096, NULL, 7, NULL);
   xTaskCreate(node_forward_task, "node_fwd", 3072, NULL, 6, NULL);
   xTaskCreate(node_ack_rx_task, "node_ack_rx", 3072, NULL, 7, NULL);
   xTaskCreate(node_ack_fwd_task, "node_ack_fwd", 4096, NULL, 5, NULL);
+  xTaskCreate(node_button_task, "node_btn", 2048, NULL, 5, NULL);
+  xTaskCreate(node_upstream_alarm_task, "node_alarm", 4096, NULL, 6, NULL);
+  xTaskCreate(node_alarm_rx_task, "node_alarm_rx", 4096, NULL, 7, NULL);
+  xTaskCreate(node_alarm_fwd_task, "node_alarm_fwd", 4096, NULL, 6, NULL);
+  xTaskCreate(node_uak_rx_task, "node_uak_rx", 4096, NULL, 7, NULL);
 #endif
 
   // TimerHandle_t timer = xTimerCreate("sys_info", pdMS_TO_TICKS(10000),

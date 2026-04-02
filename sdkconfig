@@ -434,7 +434,7 @@ CONFIG_PARTITION_TABLE_MD5=y
 #
 # Example Configuration
 #
-CONFIG_MESH_ROOT=y
+# CONFIG_MESH_ROOT is not set
 CONFIG_MESH_CHANNEL=11
 # end of Example Configuration
 
