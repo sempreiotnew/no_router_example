@@ -55,7 +55,7 @@
 #define LED_GPIO 13
 
 /* Retry config */
-#define ACK_WINDOW_MS 1500    /* wait this long before checking ACKs  */
+#define ACK_WINDOW_MS 2000    /* wait this long before checking ACKs  */
 #define MAX_RETRIES 10        /* retransmit up to N times per seq      */
 #define RETRY_DELAY_MS 800    /* wait between retries                  */
 #define SEND_INTERVAL_MS 3000 /* gap between new seq (after all ACKs)  */
@@ -1143,6 +1143,21 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
       ESP_LOGW(TAG, "❌ Disconnected from AP");
       s_wifi_connected = false;
+    }
+
+    if (event_id == WIFI_EVENT_AP_STACONNECTED) {
+      wifi_event_ap_staconnected_t *event =
+          (wifi_event_ap_staconnected_t *)event_data;
+
+      ESP_LOGI(TAG, "✅ Station joined: " MACSTR ", AID=%d",
+               MAC2STR(event->mac), event->aid);
+    }
+
+    if (event_id == WIFI_EVENT_AP_STADISCONNECTED) {
+      wifi_event_ap_stadisconnected_t *event =
+          (wifi_event_ap_stadisconnected_t *)event_data;
+
+      ESP_LOGI(TAG, "❌ Station left: " MACSTR, MAC2STR(event->mac));
     }
   }
 
