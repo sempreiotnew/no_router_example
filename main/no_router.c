@@ -55,9 +55,9 @@
 #define LED_GPIO 13
 
 /* Retry config */
-#define ACK_WINDOW_MS 2000    /* wait this long before checking ACKs  */
+#define ACK_WINDOW_MS 600     /* wait this long before checking ACKs  */
 #define MAX_RETRIES 10        /* retransmit up to N times per seq      */
-#define RETRY_DELAY_MS 800    /* wait between retries                  */
+#define RETRY_DELAY_MS 300    /* wait between retries                  */
 #define SEND_INTERVAL_MS 3000 /* gap between new seq (after all ACKs)  */
 
 #define MAX_TRACKED_NODES 32
@@ -432,11 +432,18 @@ static void root_send_task(void *arg) {
   while (1) {
     if (xQueueReceive(s_tx_queue, &msg, portMAX_DELAY) != pdTRUE)
       continue;
-    esp_err_t err = udp_broadcast(msg.data, msg.len);
-    if (err == ESP_OK) {
+    /* Burst: send 3× with 80 ms gaps to survive transient lwIP misses */
+    bool any_ok = false;
+    for (int burst = 0; burst < 3; burst++) {
+      if (burst > 0)
+        vTaskDelay(pdMS_TO_TICKS(80));
+      if (udp_broadcast(msg.data, msg.len) == ESP_OK)
+        any_ok = true;
+    }
+    if (any_ok) {
       s_tx_ok++;
-      ESP_LOGI(TAG, "[ROOT-SEND] TX  '%s'  (total_sent=%" PRIu32 ")", msg.data,
-               s_tx_ok);
+      ESP_LOGI(TAG, "[ROOT-SEND] TX (burst×3)  '%s'  (total_sent=%" PRIu32 ")",
+               msg.data, s_tx_ok);
     } else {
       s_tx_fail++;
       ESP_LOGW(TAG, "[ROOT-SEND] TX FAIL  (fail=%" PRIu32 ")", s_tx_fail);
@@ -638,8 +645,7 @@ static void node_rx_task(void *arg) {
   }
   int yes = 1;
   setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-  struct timeval tv = {.tv_sec = 3, .tv_usec = 0};
-  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+  /* NOTE: no SO_RCVTIMEO — pure blocking recv; timeout degrades lwIP socket */
 
   struct sockaddr_in bind_addr = {
       .sin_family = AF_INET,
@@ -1193,6 +1199,51 @@ static void wifi_init(void) {
       IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
 }
 
+static void log_mesh_json(uint32_t seq, bool delivered) {
+  char buf[256];
+
+  int acked = count_acked();
+
+  // Header
+  snprintf(buf, sizeof(buf),
+           "{"
+           "\"seq\":%" PRIu32 ","
+           "\"delivered\":%s,"
+           "\"acked\":%d,"
+           "\"total\":%d,"
+           "\"retries\":%" PRIu32 ","
+           "\"nodes\":[",
+           seq, delivered ? "true" : "false", acked, s_node_count, s_retries);
+
+  printf("%s", buf);
+
+  // Nodes
+  xSemaphoreTake(s_nodes_mutex, portMAX_DELAY);
+
+  for (int i = 0; i < s_node_count; i++) {
+    char node_buf[192];
+
+    snprintf(node_buf, sizeof(node_buf),
+             "{"
+             "\"mac\":\"" MACSTR "\","
+             "\"layer\":%d,"
+             "\"parent\":\"" MACSTR "\","
+             "\"acked\":%s"
+             "}%s",
+             MAC2STR(s_nodes[i].mac), s_nodes[i].level,
+             MAC2STR(s_nodes[i].parent_mac),
+             s_pending.acked[i] ? "true" : "false",
+             (i < s_node_count - 1) ? "," : "");
+
+    printf("%s", node_buf);
+  }
+
+  xSemaphoreGive(s_nodes_mutex);
+
+  // Footer
+  printf("]}\n");
+}
+
 #if CONFIG_MESH_ROOT
 void send_broadcast() {
   uint32_t seq = 0;
@@ -1212,9 +1263,6 @@ void send_broadcast() {
 
   /* ── First transmission ── */
   mesh_msg_t msg;
-  //   msg.len = (uint16_t)snprintf(msg.data, MSG_MAX_LEN, DATA_FMT, seq,
-  //                                root_mac[0], root_mac[1], root_mac[2],
-  //                                root_mac[3], root_mac[4], root_mac[5]);
 
   const char *state = button_on_off ? "true" : "false";
 
@@ -1241,18 +1289,6 @@ void send_broadcast() {
       delivered = true;
       break;
     }
-
-    // if (attempt < MAX_RETRIES) {
-    //   /* Retransmit for missing nodes */
-    //   s_retries++;
-    //   ESP_LOGW(TAG,
-    //            "[ROOT-PROD] RETRY %d/%d  seq=%" PRIu32
-    //            "  missing=%d  (total_retries=%" PRIu32 ")",
-    //            attempt + 1, MAX_RETRIES, seq, s_node_count - acked,
-    //            s_retries);
-    //   xQueueSend(s_tx_queue, &msg, pdMS_TO_TICKS(200));
-    //   vTaskDelay(pdMS_TO_TICKS(RETRY_DELAY_MS));
-    // }
 
     if (attempt < MAX_RETRIES) {
       /* Retransmit for missing nodes */
@@ -1289,6 +1325,7 @@ void send_broadcast() {
 
   /* ── Print tree with ACK status ── */
   print_tree(seq);
+  log_mesh_json(seq, delivered);
 
   s_pending.active = false;
   seq++;
