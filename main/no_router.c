@@ -52,7 +52,7 @@
 #define RX_QUEUE_DEPTH 32
 #define TX_QUEUE_DEPTH 8
 #define ACK_QUEUE_DEPTH 64
-#define LED_GPIO 13
+#define LED_GPIO 2
 
 /* Retry config */
 #define ACK_WINDOW_MS 600     /* wait this long before checking ACKs  */
@@ -662,6 +662,11 @@ static void node_rx_task(void *arg) {
   struct sockaddr_in src;
   socklen_t src_len = sizeof(src);
 
+  /* Burst dedup state — keyed on seq+alarm_state, time-bounded */
+  uint32_t rx_last_seq = UINT32_MAX;
+  bool rx_last_alarm = false;
+  TickType_t rx_last_tick = 0;
+
   while (1) {
     int len = recvfrom(sock, msg.data, MSG_MAX_LEN - 1, 0,
                        (struct sockaddr *)&src, &src_len);
@@ -673,6 +678,25 @@ static void node_rx_task(void *arg) {
     msg.data[len] = '\0';
     msg.len = (uint16_t)len;
     s_rx_count++;
+
+    /* Quick burst dedup before enqueue: parse seq+state, drop copies seen
+     * within 500ms (covers the 3-burst window of 160ms). Retries arrive
+     * after ACK_WINDOW (600ms) and pass through normally. */
+    uint32_t rx_seq = 0;
+    char rx_state[6] = {0};
+    bool rx_parsed = (sscanf(msg.data, "D:ALARM:%5[^:]:seq=%" PRIu32, rx_state,
+                             &rx_seq) == 2);
+    bool rx_alarm = (strcmp(rx_state, "true") == 0);
+    if (rx_parsed && rx_seq == rx_last_seq && rx_alarm == rx_last_alarm &&
+        (xTaskGetTickCount() - rx_last_tick) < pdMS_TO_TICKS(500)) {
+      ESP_LOGD(TAG, "[NODE-RX] burst dup seq=%" PRIu32 " dropped", rx_seq);
+      continue;
+    }
+    if (rx_parsed) {
+      rx_last_seq = rx_seq;
+      rx_last_alarm = rx_alarm;
+      rx_last_tick = xTaskGetTickCount();
+    }
 
     char src_ip[16];
     inet_ntop(AF_INET, &src.sin_addr, src_ip, sizeof(src_ip));
@@ -731,6 +755,8 @@ static void node_ack_rx_task(void *arg) {
 static void node_forward_task(void *arg) {
   mesh_msg_t msg;
   uint32_t last_seq = UINT32_MAX;
+  bool last_alarm_state = false;
+  TickType_t last_ack_tick = 0; /* tick when we last ACKed last_seq */
 
   while (1) {
     if (xQueueReceive(s_rx_queue, &msg, portMAX_DELAY) != pdTRUE)
@@ -753,39 +779,58 @@ static void node_forward_task(void *arg) {
              alarm_state, &seq, &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 8);
     bool is_alarm = (strcmp(alarm_state, "true") == 0);
 
-    if (parsed) {
-      led_state = is_alarm;
-      xTaskNotifyGive(s_blink_handle); // reuse handle
+    /* Burst dedup: same seq+state AND we ACKed it recently (<500ms) → silent
+     * drop. Keying on both seq and alarm_state ensures a state change
+     * (true→false) with the same seq (shouldn't happen after the static seq
+     * fix, but guards against old firmware on root). */
+    if (parsed && seq == last_seq && is_alarm == last_alarm_state &&
+        (xTaskGetTickCount() - last_ack_tick) < pdMS_TO_TICKS(500)) {
+      ESP_LOGD(TAG, "[NODE-FWD] burst dup seq=%" PRIu32 " dropped", seq);
+      continue;
     }
 
-    /* Gap detection */
-    if (parsed && last_seq != UINT32_MAX && seq != last_seq + 1)
-      ESP_LOGW(TAG,
-               "[NODE-FWD] GAP  expected=%" PRIu32 " got=%" PRIu32
-               " missed=%" PRIu32,
-               last_seq + 1, seq, seq - last_seq - 1);
-    if (parsed)
-      last_seq = seq;
+    bool is_dup = (parsed && seq == last_seq &&
+                   is_alarm == last_alarm_state); /* retry, not burst copy */
 
-    /* Forward downstream */
-    wifi_sta_list_t sl = {0};
-    esp_wifi_ap_get_sta_list(&sl);
-    if (sl.num > 0) {
-      if (udp_broadcast(msg.data, msg.len) == ESP_OK) {
-        s_fwd_ok++;
-        ESP_LOGI(TAG,
-                 "[NODE-FWD] FWD OK  seq=%" PRIu32
-                 "  children=%d  (fwd=%" PRIu32 ")",
-                 seq, sl.num, s_fwd_ok);
-      } else {
-        s_fwd_fail++;
-        ESP_LOGW(TAG,
-                 "[NODE-FWD] FWD FAIL  seq=%" PRIu32 "  (fail=%" PRIu32 ")",
-                 seq, s_fwd_fail);
+    if (!is_dup) {
+      if (parsed) {
+        led_state = is_alarm;
+        xTaskNotifyGive(s_blink_handle); // reuse handle
       }
+
+      /* Gap detection */
+      if (parsed && last_seq != UINT32_MAX && seq != last_seq + 1)
+        ESP_LOGW(TAG,
+                 "[NODE-FWD] GAP  expected=%" PRIu32 " got=%" PRIu32
+                 " missed=%" PRIu32,
+                 last_seq + 1, seq, seq - last_seq - 1);
+      if (parsed) {
+        last_seq = seq;
+        last_alarm_state = is_alarm;
+      }
+
+      /* Forward downstream (only on first copy) */
+      wifi_sta_list_t sl = {0};
+      esp_wifi_ap_get_sta_list(&sl);
+      if (sl.num > 0) {
+        if (udp_broadcast(msg.data, msg.len) == ESP_OK) {
+          s_fwd_ok++;
+          ESP_LOGI(TAG,
+                   "[NODE-FWD] FWD OK  seq=%" PRIu32
+                   "  children=%d  (fwd=%" PRIu32 ")",
+                   seq, sl.num, s_fwd_ok);
+        } else {
+          s_fwd_fail++;
+          ESP_LOGW(TAG,
+                   "[NODE-FWD] FWD FAIL  seq=%" PRIu32 "  (fail=%" PRIu32 ")",
+                   seq, s_fwd_fail);
+        }
+      }
+    } else {
+      ESP_LOGD(TAG, "[NODE-FWD] retry dup seq=%" PRIu32 " — re-ACK only", seq);
     }
 
-    /* Send our own ACK upstream */
+    /* ACK upstream: for new seq OR retry (not burst dups) */
     if (parsed) {
       uint8_t my_mac[6];
       esp_wifi_get_mac(WIFI_IF_STA, my_mac);
@@ -809,6 +854,7 @@ static void node_forward_task(void *arg) {
       for (int t = 0; t < 3; t++) {
         if (udp_unicast_parent(ack, ack_len, ALARM_ACK_PORT) == ESP_OK) {
           s_ack_sent++;
+          last_ack_tick = xTaskGetTickCount(); /* record when we last ACKed */
           ESP_LOGI(TAG, "[NODE-FWD] ACK sent  '%s'  (ack_sent=%" PRIu32 ")",
                    ack, s_ack_sent);
           break;
@@ -1199,39 +1245,47 @@ static void wifi_init(void) {
       IP_EVENT, IP_EVENT_STA_GOT_IP, &wifi_event_handler, NULL, NULL));
 }
 
+#if CONFIG_MESH_ROOT
+
 static void log_mesh_json(uint32_t seq, bool delivered) {
   char buf[256];
 
+  uint8_t root_mac[6];
+  esp_wifi_get_mac(WIFI_IF_STA, root_mac);
+
   int acked = count_acked();
 
-  // Header
+  // Header (NOW includes root MAC)
   snprintf(buf, sizeof(buf),
            "{"
            "\"seq\":%" PRIu32 ","
+           "\"root\":\"" MACSTR "\","
            "\"delivered\":%s,"
            "\"acked\":%d,"
            "\"total\":%d,"
            "\"retries\":%" PRIu32 ","
            "\"nodes\":[",
-           seq, delivered ? "true" : "false", acked, s_node_count, s_retries);
+           seq, MAC2STR(root_mac), delivered ? "true" : "false", acked,
+           s_node_count, s_retries);
 
   printf("%s", buf);
 
-  // Nodes
   xSemaphoreTake(s_nodes_mutex, portMAX_DELAY);
 
   for (int i = 0; i < s_node_count; i++) {
-    char node_buf[192];
+    char node_buf[256];
 
     snprintf(node_buf, sizeof(node_buf),
              "{"
              "\"mac\":\"" MACSTR "\","
              "\"layer\":%d,"
              "\"parent\":\"" MACSTR "\","
+             "\"rssi\":%d,"
              "\"acked\":%s"
              "}%s",
              MAC2STR(s_nodes[i].mac), s_nodes[i].level,
              MAC2STR(s_nodes[i].parent_mac),
+             s_nodes[i].rssi, // 🔥 RSSI added here
              s_pending.acked[i] ? "true" : "false",
              (i < s_node_count - 1) ? "," : "");
 
@@ -1240,13 +1294,11 @@ static void log_mesh_json(uint32_t seq, bool delivered) {
 
   xSemaphoreGive(s_nodes_mutex);
 
-  // Footer
   printf("]}\n");
 }
-
-#if CONFIG_MESH_ROOT
 void send_broadcast() {
-  uint32_t seq = 0;
+  static uint32_t seq = 0;
+  seq++;
   uint8_t root_mac[6];
 
   //   ESP_LOGI(TAG, "[ROOT-PROD] waiting 5s for mesh to form...");
@@ -1430,7 +1482,7 @@ void app_wifi_set_softap_info(void) {
  * app_main
  * ═══════════════════════════════════════════════════════════════════ */
 void app_main(void) {
-  esp_log_level_set("*", ESP_LOG_INFO);
+  // esp_log_level_set("*", ESP_LOG_NONE); // disable all logs
 
   esp_storage_init();
   ESP_ERROR_CHECK(esp_netif_init());
