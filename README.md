@@ -12,9 +12,9 @@ To run this example, you need at least two development boards, one configured as
 
 - Root node: There is only one root node in an ESP-Mesh-Lite network. `MESH-LITE` networks can be differentiated by their `MESH_LITE_ID` and channels.
 - Non-root node: Includes leaf nodes and intermediate nodes, which automatically select their parent nodes according to the network conditions.
-	- Leaf node: A leaf node cannot also be an intermediate node, which means leaf node cannot has any child nodes.
+  - Leaf node: A leaf node cannot also be an intermediate node, which means leaf node cannot has any child nodes.
 
-You need to go to the submenu `Example Configuration` and configure one device as a root node, and the others as non-root nodes with `idf.py menuconfig`(CMake). 
+You need to go to the submenu `Example Configuration` and configure one device as a root node, and the others as non-root nodes with `idf.py menuconfig`(CMake).
 
 You can also go to the submenu `Component config -> ESP Wi-Fi Mesh Lite`, and configure the ESP-Mesh-Lite related parameters such as the max number of layers allowed and the `MESH_LITE_ID`.
 
@@ -73,3 +73,13 @@ I (11442) no_router: System information, channel: 13, layer: 2, self mac: 58:cf:
 I (21442) no_router: System information, channel: 13, layer: 2, self mac: 58:cf:79:e9:9e:c0, parent bssid: 58:cf:79:1e:b2:59, parent rssi: -13, free heap: 209280
 I (31442) no_router: System information, channel: 13, layer: 2, self mac: 58:cf:79:e9:9e:c0, parent bssid: 58:cf:79:1e:b2:59, parent rssi: -13, free heap: 209280
 ```
+
+⏺ The missing nodes are at L3 (rssi=-89dBm) and L4. The root cause is the ACK_WINDOW_MS reduction combined with burst overhead:
+
+- Burst takes ~240ms (3 sends × 80ms gap)
+- ACK_WINDOW_MS=600ms starts counting when the message is enqueued — by the time the burst finishes (~240ms), only ~360ms remains for ACKs to arrive
+- A L4 node's ACK travels 4 hops upstream (L4→L3→L2→root) which alone can take 300–500ms
+
+Before burst, 600ms was enough. Now it isn't for deep nodes (L3+/L4+).
+
+Fix: restore ACK_WINDOW_MS to account for burst overhead + multi-hop propagation:

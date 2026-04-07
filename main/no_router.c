@@ -55,7 +55,7 @@
 #define LED_GPIO 2
 
 /* Retry config */
-#define ACK_WINDOW_MS 600     /* wait this long before checking ACKs  */
+#define ACK_WINDOW_MS 1500    /* wait this long before checking ACKs  */
 #define MAX_RETRIES 10        /* retransmit up to N times per seq      */
 #define RETRY_DELAY_MS 300    /* wait between retries                  */
 #define SEND_INTERVAL_MS 3000 /* gap between new seq (after all ACKs)  */
@@ -82,6 +82,10 @@ bool button_on_off = false;
 bool is_alarm = false;
 volatile bool led_state = false;
 static bool s_wifi_connected = false;
+#if !CONFIG_MESH_ROOT
+static volatile bool s_node_ip_changed = false; /* triggers socket recreate */
+static volatile TickType_t s_node_last_ip_tick = 0; /* tick of last IP change */
+#endif
 
 uint8_t root_mac[6];
 
@@ -117,7 +121,79 @@ static uint32_t s_upstream_alarm_acked_cnt = 0;
 /* volatile: written by uak_rx task, read by alarm send task */
 static volatile uint32_t s_node_alarm_seq = 0;
 static volatile bool s_node_alarm_acked = false;
+static esp_err_t udp_broadcast(const char *msg, uint16_t len);
+
+#define MAX_CHILD_IPS 16
+static uint32_t s_child_ips[MAX_CHILD_IPS];
+static int s_child_ip_count = 0;
+static SemaphoreHandle_t s_child_ips_mutex = NULL;
 #endif
+
+/* ═══════════════════════════════════════════════════════════════════
+ * NODE — forward to direct children (hybrid broadcast + unicast)
+ * ═══════════════════════════════════════════════════════════════════ */
+#if !CONFIG_MESH_ROOT
+
+/* Learn a direct child's IP from the source address of an incoming ACK. */
+static void child_ip_learn(uint32_t ip) {
+  if (!ip || !s_child_ips_mutex)
+    return;
+  xSemaphoreTake(s_child_ips_mutex, portMAX_DELAY);
+  for (int i = 0; i < s_child_ip_count; i++)
+    if (s_child_ips[i] == ip) {
+      xSemaphoreGive(s_child_ips_mutex);
+      return;
+    }
+  if (s_child_ip_count < MAX_CHILD_IPS)
+    s_child_ips[s_child_ip_count++] = ip;
+  xSemaphoreGive(s_child_ips_mutex);
+}
+
+/* Forward DATA to every direct child using a hybrid strategy:
+ *   1. Broadcast  — fire-and-forget; covers new/reconnected nodes whose IP
+ *                   is not yet cached (topology change, first boot).
+ *   2. Unicast    — one socket per cached child IP; gets 802.11 MAC-layer
+ *                   ACK + hardware retry so the frame is reliable.
+ * Nodes that receive both copies dedup them via the 500 ms burst window
+ * in node_rx_task.  The cache is cleared on STADISCONNECTED so stale IPs
+ * are evicted when a child leaves; broadcast covers the gap until the
+ * cache is rebuilt from the next ACK round. */
+static int udp_unicast_children(const char *msg, uint16_t len) {
+  wifi_sta_list_t sl = {0};
+  esp_wifi_ap_get_sta_list(&sl);
+  if (sl.num == 0)
+    return 0; /* no children at all */
+
+  /* Step 1: broadcast (covers everyone, no IP needed) */
+  udp_broadcast(msg, len);
+
+  /* Step 2: unicast to each cached IP */
+  if (!s_child_ips_mutex)
+    return 1;
+  xSemaphoreTake(s_child_ips_mutex, portMAX_DELAY);
+  int count = s_child_ip_count;
+  uint32_t ips[MAX_CHILD_IPS];
+  memcpy(ips, s_child_ips, count * sizeof(uint32_t));
+  xSemaphoreGive(s_child_ips_mutex);
+
+  int sent = 0;
+  for (int i = 0; i < count; i++) {
+    int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0)
+      continue;
+    struct sockaddr_in dest = {
+        .sin_family = AF_INET,
+        .sin_port = htons(ALARM_DATA_PORT),
+        .sin_addr.s_addr = ips[i],
+    };
+    if (sendto(sock, msg, len, 0, (struct sockaddr *)&dest, sizeof(dest)) > 0)
+      sent++;
+    close(sock);
+  }
+  return sent + 1; /* +1 for the broadcast */
+}
+
+#endif /* !CONFIG_MESH_ROOT */
 
 /* ═══════════════════════════════════════════════════════════════════
  * ROOT — delivery tracking
@@ -129,7 +205,8 @@ typedef struct {
   uint8_t parent_mac[6]; /* STA MAC of direct parent (bssid - 1 on ESP32) */
   int level;
   bool valid;
-  int8_t rssi; /* RSSI to direct parent, from last ACK */
+  int8_t rssi;  /* RSSI to direct parent, from last ACK */
+  bool missing; /* true if last broadcast round was not ACKed by this node */
 } tracked_node_t;
 
 typedef struct {
@@ -180,8 +257,10 @@ static void record_ack(uint32_t seq, const uint8_t mac[6], int8_t rssi,
     return;
   xSemaphoreTake(s_nodes_mutex, portMAX_DELAY);
   int idx = track_node_locked(mac, 0, rssi, parent_mac);
-  if (idx >= 0)
+  if (idx >= 0) {
     s_pending.acked[idx] = true;
+    s_nodes[idx].missing = false; /* cleared on successful ACK */
+  }
   xSemaphoreGive(s_nodes_mutex);
 }
 
@@ -244,6 +323,12 @@ static void print_children_locked(const uint8_t parent_mac[6], int depth,
                  "  \u2717 MISSING",
                  indent, branch, lvl, MAC2STR(s_nodes[i].mac),
                  (int)s_nodes[i].rssi, MAC2STR(parent_mac));
+    } else if (s_nodes[i].missing) {
+      ESP_LOGW(TAG,
+               "  %s%s [L%d] " MACSTR "  rssi=%ddBm  via=" MACSTR
+               "  \u2717 MISSING",
+               indent, branch, lvl, MAC2STR(s_nodes[i].mac),
+               (int)s_nodes[i].rssi, MAC2STR(parent_mac));
     } else {
       ESP_LOGI(TAG, "  %s%s [L%d] " MACSTR "  rssi=%ddBm  via=" MACSTR, indent,
                branch, lvl, MAC2STR(s_nodes[i].mac), (int)s_nodes[i].rssi,
@@ -304,6 +389,9 @@ static void print_tree(uint32_t seq) {
       else
         ESP_LOGW(TAG, "  └── [L%d?] " MACSTR "  rssi=%ddBm  \u2717 MISSING",
                  lvl, MAC2STR(s_nodes[i].mac), (int)s_nodes[i].rssi);
+    } else if (s_nodes[i].missing) {
+      ESP_LOGW(TAG, "  └── [L%d?] " MACSTR "  rssi=%ddBm  \u2717 MISSING", lvl,
+               MAC2STR(s_nodes[i].mac), (int)s_nodes[i].rssi);
     } else {
       ESP_LOGI(TAG, "  └── [L%d?] " MACSTR "  rssi=%ddBm", lvl,
                MAC2STR(s_nodes[i].mac), (int)s_nodes[i].rssi);
@@ -634,27 +722,34 @@ static void root_upstream_rx_task(void *arg) {
  * NODE — RX task (prio 7, never stalls)
  * ═══════════════════════════════════════════════════════════════════ */
 #if !CONFIG_MESH_ROOT
-static void node_rx_task(void *arg) {
-  int sock = -1;
-  while (sock < 0) {
-    sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock < 0) {
-      vTaskDelay(pdMS_TO_TICKS(500));
-      continue;
-    }
-  }
+static int node_rx_open_socket(void) {
+  int sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+  if (sock < 0)
+    return -1;
   int yes = 1;
   setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-  /* NOTE: no SO_RCVTIMEO — pure blocking recv; timeout degrades lwIP socket */
-
+  /* Short recv timeout so the IP-change check can wake up the loop.
+   * 1 s is fine — at this frequency lwIP socket degradation does not occur. */
+  struct timeval tv = {.tv_sec = 1, .tv_usec = 0};
+  setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
   struct sockaddr_in bind_addr = {
       .sin_family = AF_INET,
       .sin_port = htons(ALARM_DATA_PORT),
       .sin_addr.s_addr = htonl(INADDR_ANY),
   };
-  while (bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
-    ESP_LOGW(TAG, "[NODE-RX] bind() retry...");
-    vTaskDelay(pdMS_TO_TICKS(1000));
+  if (bind(sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) < 0) {
+    close(sock);
+    return -1;
+  }
+  return sock;
+}
+
+static void node_rx_task(void *arg) {
+  int sock = -1;
+  while (sock < 0) {
+    sock = node_rx_open_socket();
+    if (sock < 0)
+      vTaskDelay(pdMS_TO_TICKS(500));
   }
   ESP_LOGI(TAG, "[NODE-RX] ready  level=%d", esp_mesh_lite_get_level());
 
@@ -668,6 +763,22 @@ static void node_rx_task(void *arg) {
   TickType_t rx_last_tick = 0;
 
   while (1) {
+    /* Recreate socket after IP change so lwIP interface binding is fresh */
+    if (s_node_ip_changed) {
+      s_node_ip_changed = false;
+      ESP_LOGI(TAG, "[NODE-RX] IP changed — recreating socket");
+      close(sock);
+      sock = -1;
+      vTaskDelay(pdMS_TO_TICKS(200)); /* let lwIP settle */
+      while (sock < 0) {
+        sock = node_rx_open_socket();
+        if (sock < 0)
+          vTaskDelay(pdMS_TO_TICKS(500));
+      }
+      ESP_LOGI(TAG, "[NODE-RX] socket recreated  level=%d",
+               esp_mesh_lite_get_level());
+    }
+
     int len = recvfrom(sock, msg.data, MSG_MAX_LEN - 1, 0,
                        (struct sockaddr *)&src, &src_len);
     if (len <= 0) {
@@ -744,6 +855,7 @@ static void node_ack_rx_task(void *arg) {
       continue;
     msg.data[len] = '\0';
     msg.len = (uint16_t)len;
+    child_ip_learn(src.sin_addr.s_addr);
     char src_ip[16];
     inet_ntop(AF_INET, &src.sin_addr, src_ip, sizeof(src_ip));
     ESP_LOGI(TAG, "[NODE-ACK-RX] child ACK from=%s  '%s'", src_ip, msg.data);
@@ -809,17 +921,28 @@ static void node_forward_task(void *arg) {
         last_alarm_state = is_alarm;
       }
 
-      /* Forward downstream (only on first copy) */
-      wifi_sta_list_t sl = {0};
-      esp_wifi_ap_get_sta_list(&sl);
-      if (sl.num > 0) {
-        if (udp_broadcast(msg.data, msg.len) == ESP_OK) {
-          s_fwd_ok++;
-          ESP_LOGI(TAG,
-                   "[NODE-FWD] FWD OK  seq=%" PRIu32
-                   "  children=%d  (fwd=%" PRIu32 ")",
-                   seq, sl.num, s_fwd_ok);
-        } else {
+      /* Burst forward 3× (mirrors root burst) — gives L3+ nodes 3 chances
+       * per retry cycle. node_rx_task dedup on the receiver drops copies 2&3.
+       */
+      int child_sent = 0;
+      for (int fwd_burst = 0; fwd_burst < 3; fwd_burst++) {
+        if (fwd_burst > 0)
+          vTaskDelay(pdMS_TO_TICKS(80));
+        int r = udp_unicast_children(msg.data, msg.len);
+        if (r > 0)
+          child_sent = r;
+      }
+      if (child_sent > 0) {
+        s_fwd_ok++;
+        ESP_LOGI(TAG,
+                 "[NODE-FWD] FWD OK  seq=%" PRIu32
+                 "  unicast_to=%d  (fwd=%" PRIu32 ")",
+                 seq, child_sent, s_fwd_ok);
+      } else {
+        /* No children connected yet or send failed — not an error if leaf */
+        wifi_sta_list_t sl = {0};
+        esp_wifi_ap_get_sta_list(&sl);
+        if (sl.num > 0) {
           s_fwd_fail++;
           ESP_LOGW(TAG,
                    "[NODE-FWD] FWD FAIL  seq=%" PRIu32 "  (fail=%" PRIu32 ")",
@@ -850,18 +973,32 @@ static void node_forward_task(void *arg) {
           my_mac[3], my_mac[4], my_mac[5], (int)ap_info.rssi, par_sta[0],
           par_sta[1], par_sta[2], par_sta[3], par_sta[4], par_sta[5]);
 
-      /* Retry ACK send up to 3 times to handle transient failures */
-      for (int t = 0; t < 3; t++) {
+      /* After a topology change the STA netif briefly holds the old gateway
+       * IP while DHCP negotiates with the new parent.  sendto() returns OK
+       * even though the packet is routed to the wrong host.  Wait until the
+       * gateway has been stable for ≥300 ms before sending the first ACK. */
+      if (s_node_last_ip_tick > 0) {
+        TickType_t elapsed = xTaskGetTickCount() - s_node_last_ip_tick;
+        if (elapsed < pdMS_TO_TICKS(300))
+          vTaskDelay(pdMS_TO_TICKS(300) - elapsed);
+      }
+
+      /* Retry ACK up to 5 times with 200 ms gaps */
+      bool ack_ok = false;
+      for (int t = 0; t < 5; t++) {
         if (udp_unicast_parent(ack, ack_len, ALARM_ACK_PORT) == ESP_OK) {
           s_ack_sent++;
-          last_ack_tick = xTaskGetTickCount(); /* record when we last ACKed */
+          last_ack_tick = xTaskGetTickCount();
           ESP_LOGI(TAG, "[NODE-FWD] ACK sent  '%s'  (ack_sent=%" PRIu32 ")",
                    ack, s_ack_sent);
+          ack_ok = true;
           break;
         }
-        ESP_LOGW(TAG, "[NODE-FWD] ACK retry %d/3", t + 1);
-        vTaskDelay(pdMS_TO_TICKS(100));
+        ESP_LOGW(TAG, "[NODE-FWD] ACK retry %d/5", t + 1);
+        vTaskDelay(pdMS_TO_TICKS(200));
       }
+      if (!ack_ok)
+        ESP_LOGE(TAG, "[NODE-FWD] ACK FAILED all retries  seq=%" PRIu32, seq);
     }
   }
 }
@@ -883,27 +1020,38 @@ static void node_ack_fwd_task(void *arg) {
   }
 }
 
-/* ═══════════════════════════════════════════════════════════════════
- * NODE — GPIO0 button → trigger upstream alarm
- * ═══════════════════════════════════════════════════════════════════ */
-static void node_button_task(void *arg) {
-  gpio_config_t btn_cfg = {
-      .pin_bit_mask = 1ULL << BUTTON_GPIO,
-      .mode = GPIO_MODE_INPUT,
-      .pull_up_en = GPIO_PULLUP_ENABLE,
-  };
-  gpio_config(&btn_cfg);
+// /* ═══════════════════════════════════════════════════════════════════
+//  * NODE — GPIO0 button → trigger upstream alarm
+//  * ═══════════════════════════════════════════════════════════════════ */
+// static void node_button_task(void *arg) {
+//   gpio_config_t btn_cfg = {
+//       .pin_bit_mask = 1ULL << BUTTON_GPIO,
+//       .mode = GPIO_MODE_INPUT,
+//       .pull_up_en = GPIO_PULLUP_ENABLE,
+//   };
+//   gpio_config(&btn_cfg);
 
-  int last = 1;
+//   int last = 1;
+//   while (1) {
+//     int cur = gpio_get_level(BUTTON_GPIO);
+//     if (last == 1 && cur == 0) { /* falling edge = press */
+//       uint8_t trig = 1;
+//       xQueueSend(s_node_alarm_trigger_queue, &trig, 0);
+//       ESP_LOGI(TAG, "[NODE-BTN] GPIO0 pressed → upstream alarm triggered");
+//     }
+//     last = cur;
+//     vTaskDelay(pdMS_TO_TICKS(50));
+//   }
+// }
+
+static void node_button_task(void *arg) {
+  uint8_t trig = 1;
+
   while (1) {
-    int cur = gpio_get_level(BUTTON_GPIO);
-    if (last == 1 && cur == 0) { /* falling edge = press */
-      uint8_t trig = 1;
-      xQueueSend(s_node_alarm_trigger_queue, &trig, 0);
-      ESP_LOGI(TAG, "[NODE-BTN] GPIO0 pressed → upstream alarm triggered");
-    }
-    last = cur;
-    vTaskDelay(pdMS_TO_TICKS(50));
+    xQueueSend(s_node_alarm_trigger_queue, &trig, 0);
+    ESP_LOGI(TAG, "[NODE-TASK] Periodic trigger → upstream alarm sent");
+
+    vTaskDelay(pdMS_TO_TICKS(60000)); // 1 minute
   }
 }
 
@@ -1209,7 +1357,15 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
       wifi_event_ap_stadisconnected_t *event =
           (wifi_event_ap_stadisconnected_t *)event_data;
 
-      ESP_LOGI(TAG, "❌ Station left: " MACSTR, MAC2STR(event->mac));
+      ESP_LOGW(TAG, "❌ Station left: " MACSTR, MAC2STR(event->mac));
+#if !CONFIG_MESH_ROOT
+      if (s_child_ips_mutex) {
+        xSemaphoreTake(s_child_ips_mutex, portMAX_DELAY);
+        s_child_ip_count = 0;
+        memset(s_child_ips, 0, sizeof(s_child_ips));
+        xSemaphoreGive(s_child_ips_mutex);
+      }
+#endif
     }
   }
 
@@ -1220,6 +1376,10 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
     ESP_LOGI(TAG, "🔥 GOT IP: " IPSTR, IP2STR(&event->ip_info.ip));
 
     s_wifi_connected = true;
+#if !CONFIG_MESH_ROOT
+    s_node_ip_changed = true;
+    s_node_last_ip_tick = xTaskGetTickCount();
+#endif
   }
 }
 
@@ -1281,12 +1441,13 @@ static void log_mesh_json(uint32_t seq, bool delivered) {
              "\"layer\":%d,"
              "\"parent\":\"" MACSTR "\","
              "\"rssi\":%d,"
-             "\"acked\":%s"
+             "\"acked\":%s,"
+             "\"missing\":%s"
              "}%s",
              MAC2STR(s_nodes[i].mac), s_nodes[i].level,
-             MAC2STR(s_nodes[i].parent_mac),
-             s_nodes[i].rssi, // 🔥 RSSI added here
+             MAC2STR(s_nodes[i].parent_mac), s_nodes[i].rssi,
              s_pending.acked[i] ? "true" : "false",
+             s_nodes[i].missing ? "true" : "false",
              (i < s_node_count - 1) ? "," : "");
 
     printf("%s", node_buf);
@@ -1367,6 +1528,15 @@ void send_broadcast() {
       vTaskDelay(pdMS_TO_TICKS(RETRY_DELAY_MS));
     }
   }
+
+  /* ── Stamp persistent missing flag ── */
+  xSemaphoreTake(s_nodes_mutex, portMAX_DELAY);
+  for (int i = 0; i < s_node_count; i++) {
+    if (!s_pending.acked[i])
+      s_nodes[i].missing = true;
+    /* missing=false already cleared in record_ack for acked nodes */
+  }
+  xSemaphoreGive(s_nodes_mutex);
 
   if (!delivered) {
     ESP_LOGE(TAG,
@@ -1522,8 +1692,9 @@ void app_main(void) {
   s_fwd_ack_queue = xQueueCreate(ACK_QUEUE_DEPTH, sizeof(mesh_msg_t));
   s_node_alarm_trigger_queue = xQueueCreate(4, sizeof(uint8_t));
   s_fwd_alarm_queue = xQueueCreate(ACK_QUEUE_DEPTH, sizeof(mesh_msg_t));
+  s_child_ips_mutex = xSemaphoreCreateMutex();
   configASSERT(s_rx_queue && s_fwd_ack_queue && s_node_alarm_trigger_queue &&
-               s_fwd_alarm_queue);
+               s_fwd_alarm_queue && s_child_ips_mutex);
 #endif
 
   /* ── Tasks ── */
