@@ -83,8 +83,10 @@ bool is_alarm = false;
 volatile bool led_state = false;
 static bool s_wifi_connected = false;
 #if !CONFIG_MESH_ROOT
-static volatile bool s_node_ip_changed = false; /* triggers socket recreate */
+static volatile bool s_node_ip_changed = false; /* triggers socket recreate  */
 static volatile TickType_t s_node_last_ip_tick = 0; /* tick of last IP change */
+static volatile bool s_upstream_alarm_retry =
+    false; /* retry upstream alarm ASAP */
 #endif
 
 uint8_t root_mac[6];
@@ -950,7 +952,35 @@ static void node_forward_task(void *arg) {
         }
       }
     } else {
-      ESP_LOGD(TAG, "[NODE-FWD] retry dup seq=%" PRIu32 " — re-ACK only", seq);
+      /* Retry dup (same seq, >500ms since last ACK): re-forward to children so
+       * nodes that missed the first forward get another chance. Only burst dups
+       * (<500ms) are dropped without forwarding. */
+      ESP_LOGD(TAG, "[NODE-FWD] retry dup seq=%" PRIu32 " — re-fwd + re-ACK",
+               seq);
+      int child_sent = 0;
+      for (int fwd_burst = 0; fwd_burst < 3; fwd_burst++) {
+        if (fwd_burst > 0)
+          vTaskDelay(pdMS_TO_TICKS(80));
+        int r = udp_unicast_children(msg.data, msg.len);
+        if (r > 0)
+          child_sent = r;
+      }
+      if (child_sent > 0) {
+        s_fwd_ok++;
+        ESP_LOGI(TAG,
+                 "[NODE-FWD] FWD OK  seq=%" PRIu32
+                 "  unicast_to=%d  (fwd=%" PRIu32 ")",
+                 seq, child_sent, s_fwd_ok);
+      } else {
+        wifi_sta_list_t sl = {0};
+        esp_wifi_ap_get_sta_list(&sl);
+        if (sl.num > 0) {
+          s_fwd_fail++;
+          ESP_LOGW(TAG,
+                   "[NODE-FWD] FWD FAIL  seq=%" PRIu32 "  (fail=%" PRIu32 ")",
+                   seq, s_fwd_fail);
+        }
+      }
     }
 
     /* ACK upstream: for new seq OR retry (not burst dups) */
@@ -1088,7 +1118,24 @@ static void node_upstream_alarm_task(void *arg) {
              seq, MAC2STR(my_mac), (int)ap_info.rssi);
 
     bool acked = false;
-    for (int attempt = 1; attempt <= NODE_ALARM_RETRIES; attempt++) {
+    int attempt = 0;
+    while (!acked) {
+      attempt++;
+
+      /* On IP change: wait for gw stability before sending */
+      if (s_node_last_ip_tick > 0) {
+        TickType_t elapsed = xTaskGetTickCount() - s_node_last_ip_tick;
+        if (elapsed < pdMS_TO_TICKS(300))
+          vTaskDelay(pdMS_TO_TICKS(300) - elapsed);
+      }
+      s_upstream_alarm_retry = false;
+
+      /* Refresh RSSI on every attempt so the message stays current */
+      esp_wifi_sta_get_ap_info(&ap_info);
+      msg_len = (uint16_t)snprintf(msg, sizeof(msg), UA_FMT, seq, my_mac[0],
+                                   my_mac[1], my_mac[2], my_mac[3], my_mac[4],
+                                   my_mac[5], (int)ap_info.rssi);
+
       esp_err_t err = udp_unicast_parent(msg, msg_len, NODE_ALARM_PORT);
       if (err == ESP_OK) {
         ESP_LOGI(TAG, "[NODE-ALARM] sent  attempt=%d/%d  seq=%" PRIu32, attempt,
@@ -1098,8 +1145,14 @@ static void node_upstream_alarm_task(void *arg) {
                  attempt, NODE_ALARM_RETRIES, seq);
       }
 
-      /* Wait for ACK */
-      vTaskDelay(pdMS_TO_TICKS(NODE_ALARM_ACK_WINDOW_MS));
+      /* Wait for ACK — cut short if IP change signals immediate retry */
+      for (int w = 0; w < (NODE_ALARM_ACK_WINDOW_MS / 100); w++) {
+        vTaskDelay(pdMS_TO_TICKS(100));
+        if (s_node_alarm_acked && s_node_alarm_seq == seq)
+          break;
+        if (s_upstream_alarm_retry)
+          break; /* IP changed — retry now */
+      }
 
       if (s_node_alarm_acked && s_node_alarm_seq == seq) {
         acked = true;
@@ -1111,19 +1164,12 @@ static void node_upstream_alarm_task(void *arg) {
         break;
       }
 
-      if (attempt < NODE_ALARM_RETRIES) {
-        ESP_LOGW(TAG, "[NODE-ALARM] no ACK yet, retry %d/%d  seq=%" PRIu32,
-                 attempt + 1, NODE_ALARM_RETRIES, seq);
-        vTaskDelay(pdMS_TO_TICKS(NODE_ALARM_RETRY_DELAY_MS));
-      }
-    }
+      ESP_LOGW(TAG, "[NODE-ALARM] no ACK yet, retry %d/%d  seq=%" PRIu32,
+               attempt + 1, NODE_ALARM_RETRIES, seq);
 
-    if (!acked) {
-      ESP_LOGE(TAG,
-               "[NODE-ALARM] DELIVERY FAILED  seq=%" PRIu32
-               "  after %d retries  (sent=%" PRIu32 "  acked=%" PRIu32 ")",
-               seq, NODE_ALARM_RETRIES, s_upstream_alarm_sent,
-               s_upstream_alarm_acked_cnt);
+      /* Short pause before next retry (skip if IP change pending) */
+      if (!s_upstream_alarm_retry)
+        vTaskDelay(pdMS_TO_TICKS(NODE_ALARM_RETRY_DELAY_MS));
     }
   }
 }
@@ -1182,20 +1228,58 @@ static void node_alarm_rx_task(void *arg) {
   }
 }
 
-/* NODE — upstream alarm relay: takes from queue, forwards upstream.
- * Mirrors node_ack_fwd_task — the proven forwarding pattern. */
+/* NODE — upstream alarm relay: stores last alarm, retries indefinitely until
+ * a UAK propagates back (s_upstream_alarm_retry speeds up on IP change). */
+static volatile bool s_fwd_alarm_uak_received = false;
+
 static void node_alarm_fwd_task(void *arg) {
-  mesh_msg_t msg;
+  mesh_msg_t pending;
+  pending.len = 0;
+
   while (1) {
-    if (xQueueReceive(s_fwd_alarm_queue, &msg, portMAX_DELAY) != pdTRUE)
+    /* Pick up new alarm (or replacement) from queue — non-blocking when
+     * we already have a pending message to retry. */
+    mesh_msg_t tmp;
+    BaseType_t got = xQueueReceive(s_fwd_alarm_queue, &tmp,
+                                   pending.len > 0 ? 0 : portMAX_DELAY);
+    if (got == pdTRUE) {
+      memcpy(&pending, &tmp, sizeof(pending));
+      s_fwd_alarm_uak_received = false; /* new alarm resets UAK state */
+    }
+
+    if (pending.len == 0)
       continue;
-    for (int t = 0; t < 5; t++) {
-      if (udp_unicast_parent(msg.data, msg.len, NODE_ALARM_PORT) == ESP_OK) {
-        ESP_LOGI(TAG, "[NODE-ALARM-FWD] relayed upstream  '%s'", msg.data);
-        break;
-      }
-      ESP_LOGW(TAG, "[NODE-ALARM-FWD] relay retry %d/5", t + 1);
+
+    /* Stop retrying once a UAK has been received for this alarm */
+    if (s_fwd_alarm_uak_received) {
+      pending.len = 0;
+      continue;
+    }
+
+    /* Wait for gw stability after IP change */
+    if (s_node_last_ip_tick > 0) {
+      TickType_t elapsed = xTaskGetTickCount() - s_node_last_ip_tick;
+      if (elapsed < pdMS_TO_TICKS(300))
+        vTaskDelay(pdMS_TO_TICKS(300) - elapsed);
+    }
+    s_upstream_alarm_retry = false;
+
+    if (udp_unicast_parent(pending.data, pending.len, NODE_ALARM_PORT) ==
+        ESP_OK) {
+      ESP_LOGI(TAG, "[NODE-ALARM-FWD] relayed upstream  '%s'", pending.data);
+    } else {
+      ESP_LOGW(TAG, "[NODE-ALARM-FWD] relay retry %d/5", 1);
+    }
+
+    /* Wait before next retry — cut short on IP change or new queue item */
+    for (int w = 0; w < 10; w++) { /* 10 × 200 ms = 2 s max wait */
       vTaskDelay(pdMS_TO_TICKS(200));
+      if (s_upstream_alarm_retry)
+        break;
+      if (s_fwd_alarm_uak_received)
+        break;
+      if (uxQueueMessagesWaiting(s_fwd_alarm_queue) > 0)
+        break;
     }
   }
 }
@@ -1252,6 +1336,9 @@ static void node_uak_rx_task(void *arg) {
       uint8_t ack_mac[6];
       for (int i = 0; i < 6; i++)
         ack_mac[i] = (uint8_t)m[i];
+
+      /* Any UAK means root received an upstream alarm — stop fwd retries */
+      s_fwd_alarm_uak_received = true;
 
       /* Is this ACK for us? */
       if (memcmp(ack_mac, my_mac, 6) == 0) {
@@ -1379,6 +1466,7 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base,
 #if !CONFIG_MESH_ROOT
     s_node_ip_changed = true;
     s_node_last_ip_tick = xTaskGetTickCount();
+    s_upstream_alarm_retry = true;
 #endif
   }
 }
